@@ -1,4 +1,33 @@
 module BERTRPC
+  class ConnectionPool
+        
+    attr_accessor :count, :current, :timeout    
+    #make sure BERT_CONFIG is defined
+    unless defined?(BERT_CONFIG)
+      BERT_CONFIG = YAML::load(ERB.new(IO.read("#{RAILS_ROOT}/config/presence.yml")).result + "\n")
+    end
+
+    include Singleton
+    
+    def initialize
+      @current = 0
+      @timeout = 3
+      @count = BERT_CONFIG[RAILS_ENV].count
+    end
+    
+    def self.get_connection
+      if instance.count >= 2 then
+        prev = instance.current      
+        begin     
+          instance.current = rand(instance.count) # pick a random start point
+        end while instance.current == prev  
+      end
+      host,port = BERT_CONFIG[RAILS_ENV][instance.current].split(":")
+      @svc = BERTRPC::Service.new(host, port.to_i, instance.timeout)
+    end
+
+  end
+  
   class Action
     include Encodes
 
@@ -8,6 +37,8 @@ module BERTRPC
       @mod = mod
       @fun = fun
       @args = args
+      @cycle = 0
+      @max_retries = 3 * ConnectionPool.instance.count
     end
 
     def execute
@@ -56,12 +87,16 @@ module BERTRPC
       raise ProtocolError.new(ProtocolError::NO_DATA) unless bert_response
       sock.close
       bert_response
-    rescue Errno::ECONNREFUSED
-      raise ConnectionError.new(@svc.host, @svc.port)
-    rescue Errno::EAGAIN
-      raise ReadTimeoutError.new(@svc.host, @svc.port, @svc.timeout)
-    rescue Errno::ECONNRESET
-      raise ReadError.new(@svc.host, @svc.port)
+    rescue Errno::ECONNREFUSED,Errno::EAGAIN,Errno::ECONNRESET,Errno::EINPROGRESS,Errno::EALREADY,Errno::EWOULDBLOCK
+      sock.close unless sock.nil?
+      @svc = ConnectionPool.get_connection
+      @cycle += 1
+      if(@cycle < @max_retries)
+        retry
+      else
+        raise ConnectionError.new(@svc.host, @svc.port)
+      end
+      @cycle = 0
     end
 
     # Creates a socket object which does speedy, non-blocking reads
@@ -76,7 +111,6 @@ module BERTRPC
       addr = Socket.getaddrinfo(host, nil, Socket::AF_INET)
       sock = Socket.new(Socket.const_get(addr[0][0]), Socket::SOCK_STREAM, 0)
       sock.setsockopt Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1
-
       if timeout
         secs = Integer(timeout)
         usecs = Integer((timeout - secs) * 1_000_000)
@@ -84,8 +118,8 @@ module BERTRPC
         sock.setsockopt Socket::SOL_SOCKET, Socket::SO_RCVTIMEO, optval
         sock.setsockopt Socket::SOL_SOCKET, Socket::SO_SNDTIMEO, optval
       end
-
-      sock.connect(Socket.pack_sockaddr_in(port, addr[0][3]))
+      sockaddr = Socket.pack_sockaddr_in(port, addr[0][3])
+      sock.connect(sockaddr) 
       sock
     end
   end
